@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,6 +350,74 @@ func TestGetArtifactVersions(t *testing.T) {
 			for i, want := range tt.want {
 				assert.Equal(t, want, got[i])
 			}
+		})
+	}
+}
+
+func TestGetArtifactVersions_GroupEdges(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name      string
+		alias     string
+		failOnGet int32
+		status    int
+		wantTags  []string
+		wantErr   bool
+	}{
+		{name: "signature alias excludes its whole group", alias: "v2.sig"},
+		{name: "deleted alias preserves remaining group", alias: "v2", failOnGet: 1,
+			status: http.StatusNotFound, wantTags: []string{"v1", "v3"}},
+		{name: "digest not found propagates", alias: "v2", failOnGet: 2,
+			status: http.StatusNotFound, wantErr: true},
+		{name: "digest forbidden propagates", alias: "v2", failOnGet: 2,
+			status: http.StatusForbidden, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reg := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+			var gets atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/manifests/"+tt.alias) {
+					// The first GET loads the image; the second resolves its top-level digest.
+					if n := gets.Add(1); tt.failOnGet > 0 && n >= tt.failOnGet {
+						w.WriteHeader(tt.status)
+						return
+					}
+				}
+				reg.ServeHTTP(w, r)
+			}))
+			t.Cleanup(srv.Close)
+			host := strings.TrimPrefix(srv.URL, "http://")
+			img, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{
+				Created: v1.Time{Time: time.Now().UTC()}, OS: "linux", Architecture: "amd64",
+			})
+			require.NoError(t, err)
+			for _, tag := range []string{"v1", tt.alias, "v3"} {
+				ref, err := name.NewTag(host + "/myimage:" + tag)
+				require.NoError(t, err)
+				require.NoError(t, remote.Write(ref, img))
+			}
+			filter, err := artif.BuildFilter(nil, "")
+			require.NoError(t, err)
+			got, err := New(nil, host, host).GetArtifactVersions(
+				context.Background(), &minderv1.Artifact{Name: "myimage"}, filter)
+			if tt.wantErr {
+				require.ErrorContains(t, err, "unable to get digest for tag "+tt.alias)
+				assert.Nil(t, got, "do not return a partial group after a digest failure")
+			} else {
+				require.NoError(t, err)
+				if tt.wantTags == nil {
+					assert.Empty(t, got)
+				} else {
+					require.Len(t, got, 1)
+					assert.Equal(t, tt.wantTags, got[0].Tags)
+					digest, err := img.Digest()
+					require.NoError(t, err)
+					assert.Equal(t, digest.String(), got[0].Sha)
+				}
+			}
+			assert.GreaterOrEqual(t, gets.Load(), tt.failOnGet)
 		})
 	}
 }
